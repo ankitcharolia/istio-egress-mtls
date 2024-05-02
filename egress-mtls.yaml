@@ -1,0 +1,147 @@
+# Reference: https://istio.io/latest/blog/2020/dns-proxy/#external-tcp-services-without-vips - DNS explanation - smart DNS Proxy and nulti-cluster setup, check ndots
+# Reference: https://github.com/istio/istio/issues/42238
+# Reference: https://www.bookstack.cn/read/istio-1.11.0-en/15b4984e9d5fe10d.md
+# Reference: envoy dynamic forward proxy : https://github.com/istio/istio/issues/15778
+# https://github.com/istio/istio.io/issues/14126
+# https://istio.io/latest/blog/2023/egress-sni/ <--- blog
+# Understad TLS config: https://istio.io/latest/docs/ops/configuration/traffic-management/tls-configuration/
+# https://istio.io/latest/docs/tasks/traffic-management/egress/egress-gateway/#egress-gateway-for-http-traffic
+# PeerAuthentication is used to configure what type of mTLS traffic the sidecar will accept.
+# DestinationRule is used to configure what type of TLS traffic the sidecar will send.
+# MOST IMPORTANT: https://gist.github.com/yangminzhu/2123c6614825aeadba38279110450b62
+# MOST IMPORTANT: # Reference: https://www.bookstack.cn/read/istio-1.11.0-en/d0bd7ceab5fb9bdd.md
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bash-script
+data:
+  bash.sh: |
+    #!/bin/bash
+    apt-get update
+    apt-get install -y curl wget dnsutils net-tools iputils-ping telnet netcat-traditional gpg vim
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ubuntu-tls-test
+  labels:
+    app: ubuntu
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      istio: egressgateway
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: ubuntu
+        istio: egressgateway
+        sidecar.istio.io/inject: "true"
+    spec:
+      containers:
+      - image: ubuntu:24.04
+        name: ubuntu
+        command: ["/bin/sleep", "3650d"]
+        resources:
+          limits:
+            cpu: "1"
+            memory: "500Mi"
+          requests:
+            cpu: "0.5"
+            memory: "256Mi"
+        volumeMounts:
+          - mountPath: /data
+            name: bash-script
+      volumes:
+      - name: bash-script
+        configMap:
+          name: bash-script
+          defaultMode: 0777
+---
+apiVersion: networking.istio.io/v1beta1
+kind: ServiceEntry
+metadata:
+  name: wikipedia
+  namespace: default
+spec:
+  hosts:
+  - wikipedia.org
+  ports:
+  - number: 443
+    name: tls
+    protocol: TLS
+  resolution: DNS
+  location: MESH_EXTERNAL
+---
+apiVersion: networking.istio.io/v1alpha3
+kind: VirtualService
+metadata:
+  name: direct-sidecar-wikipedia-through-egress-gateway
+  namespace: default
+spec:
+  hosts:
+  - wikipedia.org
+  gateways:
+  - mesh
+  - istio-egress/wikipedia-gateway
+  tls:
+  - match:
+    - gateways:
+      - mesh
+      port: 443
+      sniHosts:
+      - wikipedia.org
+    route:
+    - destination:
+        host: istio-egressgateway.istio-egress.svc.cluster.local
+        subset: wildcard
+        port:
+          number: 443
+  tcp:
+  - match:
+    - gateways:
+      - istio-egress/wikipedia-gateway
+      port: 443
+    route:
+    - destination:
+        host: wikipedia.org
+        port:
+          number: 443
+      weight: 100
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: wikipedia-ds
+  namespace: default
+spec:
+  host: istio-egressgateway.istio-egress.svc.cluster.local
+  subsets:
+  - name: wildcard
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+      tls:
+        mode: ISTIO_MUTUAL
+        sni: wikipedia.org
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: wikipedia-gateway
+  namespace: istio-egress
+spec:
+  selector:
+    istio: egressgateway
+  servers:
+  - port:
+      number: 443
+      name: tls-egress
+      protocol: TLS
+    hosts:
+    - 'wikipedia.org'
+    tls:
+      mode: ISTIO_MUTUAL
